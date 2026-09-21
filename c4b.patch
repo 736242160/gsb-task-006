@@ -1,0 +1,193 @@
+*** Begin Patch
+*** Update File: gc_stw_sim.py
+@@
+-// __JS_PART__
++"use strict";
++
++var CELL = 10;
++var gridC = document.getElementById("grid");
++var gx = gridC.getContext("2d");
++var sparkC = document.getElementById("spark-alloc");
++var sx = sparkC.getContext("2d");
++
++var state = null;
++var prevColors = null;
++var flashes = [];        // 新分配闪光 {idx,t}
++var freedFx = [];        // 回收扩散环 {idx,t}
++var stwActive = false;
++var stwBegin = 0;
++var rateHist = [];
++var stwHist = [];
++var paused = false;
++
++var COLORS = {
++  0: null,
++  1: "#34d399",
++  2: "#1d5c48",
++  3: "#f59e0b"
++};
++
++var B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++var B64_LOOKUP = (function () {
++  var o = {};
++  for (var i = 0; i < B64.length; i++) o[B64.charAt(i)] = i;
++  return o;
++})();
++
++function decodeColors(str) {
++  var out = new Uint8Array(Math.floor(str.length / 4) * 3);
++  var p = 0;
++  for (var i = 0; i < str.length; i += 4) {
++    var a = B64_LOOKUP[str.charAt(i)];
++    var b = B64_LOOKUP[str.charAt(i + 1)];
++    var c = B64_LOOKUP[str.charAt(i + 2)];
++    var d = B64_LOOKUP[str.charAt(i + 3)];
++    var n = (a << 18) | (b << 12) | (c << 6) | d;
++    out[p++] = (n >> 16) & 255;
++    out[p++] = (n >> 8) & 255;
++    out[p++] = n & 255;
++  }
++  return out;
++}
++
++function postAction(body) {
++  fetch("/control", {
++    method: "POST",
++    headers: {"Content-Type": "application/json"},
++    body: JSON.stringify(body)
++  }).catch(function () {});
++}
++
++function poll() {
++  fetch("/state", {cache: "no-store"})
++    .then(function (r) { return r.json(); })
++    .then(function (s) {
++      if (state && s.gen !== state.gen) {
++        prevColors = null;
++        flashes = [];
++        freedFx = [];
++      }
++      var colors = decodeColors(s.colors);
++      var now = s.t;
++      if (prevColors && prevColors.length === colors.length) {
++        for (var i = 0; i < colors.length; i++) {
++          var o = prevColors[i], n = colors[i];
++          if (o === n) continue;
++          if (n === 1 || (n === 2 && (o === 0))) {
++            if (o === 0 && n === 1) flashes.push({idx: i, t: now});
++          }
++          if (n === 0 && o !== 0) freedFx.push({idx: i, t: now});
++        }
++      }
++      prevColors = colors;
++      s._colors = colors;
++      state = s;
++      if (s.stw && !stwActive) { stwActive = true; stwBegin = s.stw_begin || s.t; }
++      if (!s.stw) stwActive = false;
++      rateHist.push({t: now, v: s.alloc_rate, stw: s.stw});
++      while (rateHist.length > 160) rateHist.shift();
++    })
++    .catch(function () {})
++    .then(function () { setTimeout(poll, 50); });
++}
++
++var bgCanvas = document.createElement("canvas");
++bgCanvas.width = gridC.width;
++bgCanvas.height = gridC.height;
++(function paintBase() {
++  var b = bgCanvas.getContext("2d");
++  b.fillStyle = "#070a0f";
++  b.fillRect(0, 0, gridC.width, gridC.height);
++  b.strokeStyle = "rgba(42,58,82,0.18)";
++  b.lineWidth = 1;
++  for (var x = 0; x <= gridC.width; x += CELL) {
++    b.beginPath(); b.moveTo(x + 0.5, 0); b.lineTo(x + 0.5, gridC.height); b.stroke();
++  }
++  for (var y = 0; y <= gridC.height; y += CELL) {
++    b.beginPath(); b.moveTo(0, y + 0.5); b.lineTo(gridC.width, y + 0.5); b.stroke();
++  }
++})();
++
++function drawGrid(nowSec) {
++  if (!state) return;
++  var s = state;
++  var w = s.w, h = s.h;
++  gx.drawImage(bgCanvas, 0, 0);
++
++  var colors = s._colors;
++  var i, x, y;
++  for (i = 0; i < colors.length; i++) {
++    var c = COLORS[colors[i]];
++    if (!c) continue;
++    x = (i % w) * CELL;
++    y = Math.floor(i / w) * CELL;
++    gx.fillStyle = c;
++    gx.fillRect(x + 1, y + 1, CELL - 2, CELL - 2);
++  }
++
++  // GC 光标轨迹（按年龄衰减）
++  var trail = s.trail;
++  var newestMark = null, newestSweep = null;
++  for (var k = 0; k < trail.length; k++) {
++    var e = trail[k];
++    var idx = e[0], kind = e[1], ts = e[2];
++    var age = nowSec - ts;
++    if (age < 0 || age > 1.2) continue;
++    var alpha = 1.0 - age / 1.2;
++    x = (idx % w) * CELL + CELL / 2;
++    y = Math.floor(idx / w) * CELL + CELL / 2;
++    if (kind === 2) {
++      // 清除扫描线：整条横线
++      gx.strokeStyle = "rgba(239,68,68," + (0.25 + 0.65 * alpha) + ")";
++      gx.lineWidth = 2;
++      gx.beginPath();
++      gx.moveTo(0, y);
++      gx.lineTo(gridC.width, y);
++      gx.stroke();
++      if (!newestSweep || ts > newestSweep[2]) newestSweep = e;
++    } else {
++      var rad = 1 + (1 - alpha) * 5;
++      gx.fillStyle = "rgba(34,211,238," + (0.12 + 0.5 * alpha) + ")";
++      gx.beginPath();
++      gx.arc(x, y, rad, 0, Math.PI * 2);
++      gx.fill();
++      if (!newestMark || ts > newestMark[2]) newestMark = e;
++    }
++  }
++  if (newestMark) {
++    i = newestMark[0];
++    gx.strokeStyle = "rgba(165,243,252,0.95)";
++    gx.lineWidth = 1.5;
++    gx.strokeRect((i % w) * CELL + 0.5, Math.floor(i / w) * CELL + 0.5,
++                  CELL - 1, CELL - 1);
++  }
++
++  // 新分配：淡绿色呼吸闪光
++  flashes = flashes.filter(function (f) { return nowSec - f.t < 0.55; });
++  for (var fi = 0; fi < flashes.length; fi++) {
++    var f = flashes[fi];
++    var fa = 1 - (nowSec - f.t) / 0.55;
++    x = (f.idx % w) * CELL;
++    y = Math.floor(f.idx / w) * CELL;
++    gx.fillStyle = "rgba(110,231,183," + (0.55 * fa) + ")";
++    gx.fillRect(x, y, CELL, CELL);
++  }
++
++  // 回收：橙色扩散环
++  freedFx = freedFx.filter(function (f) { return nowSec - f.t < 0.6; });
++  for (var ri = 0; ri < freedFx.length; ri++) {
++    var f2 = freedFx[ri];
++    var age2 = nowSec - f2.t;
++    var rr = 2 + age2 * 12;
++    x = (f2.idx % w) * CELL + CELL / 2;
++    y = Math.floor(f2.idx / w) * CELL + CELL / 2;
++    gx.strokeStyle = "rgba(251,146,60," + (0.8 * (1 - age2 / 0.6)) + ")";
++    gx.lineWidth = 1.2;
++    gx.beginPath();
++    gx.arc(x, y, rr, 0, Math.PI * 2);
++    gx.stroke();
++  }
++}
++
++// __JS_UI__
+*** End Patch

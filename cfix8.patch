@@ -1,0 +1,12 @@
+*** Begin Patch
+*** Update File: gc_stw_sim.py
+@@
+             threads = [{"name": m.name, "parked": m.parked,
+                         "ops": m.ops} for m in self.mutators]
+             paused = self.paused
+             gen = self.gen
++            armed = self.stw_armed.is_set()
+@@
+-            "stw": phase in (PHASE_STW_REMARK, PHASE_STW_SWEEP),
++            "stw": armed,
+*** End Patch

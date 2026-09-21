@@ -1,0 +1,14 @@
+*** Begin Patch
+*** Update File: gc_stw_sim.py
+@@
+         with self.stop_cond:
+             self.stw_epoch += 1
+             epoch = self.stw_epoch
+-            self.acks = {(m.tid, epoch) for m in self.mutators
+-                         if m.alive and m is not threading.current_thread()}
++            # acks 必须从空集开始：只有 mutator 真正抵达安全点并自行登记后
++            # 才算挂起。预先把线程放进集合会让 GC 在线程仍在改写堆时就
++            # 开始清扫，是致命的协议错误。
++            self.acks = set()
+             self.stop_cond.notify_all()
+*** End Patch

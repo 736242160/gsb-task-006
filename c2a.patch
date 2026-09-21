@@ -1,0 +1,190 @@
+*** Begin Patch
+*** Update File: gc_stw_sim.py
+@@
+         self._last_cursor = None
+         self._alloc_base = 0
+         self._freed_base = 0
+         self._stat_t = time.time()
++        self.stw_begin_t = 0.0
+ 
+         self.mutators = [Mutator(i, self) for i in range(self.n_mutators)]
+         self.gc = GcThread(self)
+         if prewarm:
+             self.prewarm()
+@@
+     def _root_push(self, mutator, idx):
+         """给某 mutator 挂 root，超出上限时丢弃最旧 root（走 SATB 屏障）。"""
+         roots = mutator.roots
+         roots.append(idx)
+         if len(roots) > ROOT_CAP:
+             old = roots.pop(0)
+             if self.marking:
+                 self.satb.append(old)
+ 
+ 
+-# === CONT ===
++    # ------------------------------------------------------------------
++    # STW 安全点协议
++    #
++    # begin_stw()  仅由 GC 线程调用：推进 stw_epoch 并广播；
++    #              然后等待「所有存活 mutator」在同一个 epoch 上登记 ack。
++    # end_stw()    由 GC 线程调用：把当前 epoch 作废并广播放行。
++    # safepoint()  仅由 mutator 在操作循环边界调用：发现自己落后于当前
++    #              STW epoch 就登记 ack 并阻塞，直到 GC 放行。
++    #
++    # 等待全部基于 Condition + 超时 + running 标志，任何路径都不会
++    # 永久等待；stop_cond 锁内绝不申请 heap_lock（GC 在 heap 工作完成
++    # 释放 heap_lock 后才调用 end_stw），锁序恒定，不可能成环死锁。
++    # ------------------------------------------------------------------
++    def begin_stw(self, phase):
++        """挂起全部 mutator。成功返回 True；关停或超时返回 False。"""
++        with self.heap_lock:
++            self.phase = phase
++            self.stw_begin_t = time.time()
++        with self.stop_cond:
++            self.stw_epoch += 1
++            epoch = self.stw_epoch
++            self.acks = {(m.tid, epoch) for m in self.mutators
++                         if m.alive and m is not threading.current_thread()}
++            self.stop_cond.notify_all()
++            deadline = time.time() + 5.0
++            while self.running:
++                need = {(m.tid, epoch) for m in self.mutators
++                        if m.alive and m is not threading.current_thread()}
++                if need <= self.acks:
++                    self.stw_count += 1
++                    return True
++                left = deadline - time.time()
++                if left <= 0:
++                    # 兜底：真实 VM 里此处会进入安全点强制接管；
++                    # 仿真里记一次超时并继续，保证系统永远可恢复。
++                    self.stw_timeouts += 1
++                    return False
++                self.stop_cond.wait(timeout=min(0.05, left))
++        return False
++
++    def end_stw(self):
++        with self.stop_cond:
++            self.epoch = self.stw_epoch
++            self.acks = set()
++            self.stop_cond.notify_all()
++
++    def safepoint(self, mutator):
++        """mutator 协作式安全点：暂停 / STW 时在此挂起。返回 False 表示应退出。"""
++        parked = False
++        with self.stop_cond:
++            while self.running:
++                epoch = self.stw_epoch
++                want_park = self.paused or epoch > self.epoch
++                if not want_park:
++                    break
++                if not parked:
++                    self.acks.add((mutator.tid, epoch))
++                    self.stop_cond.notify_all()
++                    parked = True
++                    mutator.parked = True
++                self.stop_cond.wait(timeout=0.25)
++        mutator.parked = False
++        return self.running
++
++    def start_threads(self):
++        self.gc.start()
++        for m in self.mutators:
++            m.start()
++
++    def shutdown(self):
++        self.running = False
++        self.manual_gc.set()
++        with self.stop_cond:
++            self.stop_cond.notify_all()
++        for m in self.mutators:
++            m.join(timeout=2.0)
++        self.gc.join(timeout=2.0)
++
++
++class Mutator(threading.Thread):
++    """应用线程：按目标速率分配对象 / 改引用图 / 丢 root。"""
++
++    def __init__(self, tid, sim):
++        super(Mutator, self).__init__(name="mutator-%d" % tid, daemon=True)
++        self.tid = tid
++        self.sim = sim
++        self.roots = []
++        self.rng = random.Random()
++        self.parked = False
++        self.alive = True
++        self.ops = 0
++
++    # 可被 STW / 暂停立即打断的操作间隔睡眠
++    def _sleep_interruptible(self, seconds):
++        end = time.time() + seconds
++        while self.sim.running:
++            left = end - time.time()
++            if left <= 0:
++                return
++            with self.sim.stop_cond:
++                if self.sim.paused or self.sim.stw_epoch > self.sim.epoch:
++                    return
++                self.sim.stop_cond.wait(timeout=min(0.02, left))
++
++    def run(self):
++        sim = self.sim
++        per_thread = max(1.0, sim.rate_total / max(1, sim.n_mutators))
++        interval = 1.0 / per_thread
++        while sim.running:
++            if not sim.safepoint(self):
++                break
++            if sim.phase != PHASE_IDLE and sim.phase != PHASE_MARK:
++                # STW 期间所有应用操作都被安全点挡住，这里只是双保险
++                self._sleep_interruptible(0.01)
++                continue
++            roll = self.rng.random()
++            if roll < 0.60:
++                self.op_alloc()
++            elif roll < 0.82:
++                self.op_ref()
++            else:
++                self.op_drop()
++            self.ops += 1
++            self._sleep_interruptible(interval)
++        self.alive = False
++
++    def op_alloc(self):
++        sim = self.sim
++        with sim.heap_lock:
++            idx = sim._alloc_locked(self.rng)
++            if idx >= 0:
++                sim._root_push(self, idx)
++
++    def op_ref(self):
++        """随机给一个已存活对象改写出边（SATB 记录旧值 + 新值即时标记）。"""
++        sim = self.sim
++        with sim.heap_lock:
++            src = sim._occupied_sample_locked(self.rng)
++            if src < 0:
++                return
++            edges = sim.cells[src]
++            if edges:
++                old = next(iter(edges))
++                if sim.marking:
++                    sim.satb.append(old)      # SATB：旧目标兜底
++                edges.discard(old)
++            dst = sim._occupied_sample_locked(self.rng)
++            if dst >= 0 and dst != src and len(edges) < MAX_EDGES:
++                edges.add(dst)
++                if sim.marking and not sim.mark[dst]:
++                    sim._mark_push_locked(dst)  # 增量更新屏障
++
++    def op_drop(self):
++        """丢弃一个本线程 root（旧值进 SATB 日志），是垃圾的主要来源。"""
++        sim = self.sim
++        with sim.heap_lock:
++            if self.roots:
++                pos = self.rng.randrange(len(self.roots))
++                old = self.roots.pop(pos)
++                if sim.marking:
++                    sim.satb.append(old)
++
++
++# === CONT2 ===
+*** End Patch

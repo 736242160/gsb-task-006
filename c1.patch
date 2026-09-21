@@ -1,0 +1,230 @@
+*** Begin Patch
+*** Add File: gc_stw_sim.py
++#!/usr/bin/env python3
++# -*- coding: utf-8 -*-
++"""
++gc_stw_sim.py —— 自研 VM 的 GC / Stop-The-World 并发仿真内核（单文件闭环）
++
++仅依赖 Python 标准库：
++  - threading        应用线程(mutator) / GC 线程 / 内置 HTTP 服务线程
++  - http.server      渲染原生 HTML + Canvas 页面并推送仿真快照
++  - json / base64    堆网格快照编码
++  - webbrowser       一键打开演示页面
++
++一、并发模型
++  * N 个 mutator 线程：随机分配对象、改写引用边、丢弃 root，持续制造垃圾。
++  * 1 个 GC 线程：定期执行「并发标记 -> STW 重标记 -> STW 清除」。
++  * 任意数量的 HTTP 线程：只读拷贝快照，绝不阻塞后台线程。
++
++二、并发图遍历的读写竞态处理（严格保守，保证不漏标）
++  * heap_lock 是唯一的堆锁，保护对象表/引用边/mark 位/颜色/统计量。
++  * SATB（Snapshot-At-The-Beginning）旧值写屏障：
++        改写或删除出边、从 root 集合摘除对象之前，先把旧目标记入 satb 日志。
++    于是并发标记开始那一刻「逻辑存活」的对象，即使引用随后被 mutator
++    删光，也会被日志兜住并继续扫描。
++  * 新增量屏障（incremental update）：标记期间新加入的出边，若目标未标记
++    则立即入栈——这是比 SATB 更强的一层保守保护。
++  * 标记期间新分配的对象一律立即标记（视为 mutator 的新 root）。
++  * 最终标记收敛(remark)阶段所有 mutator 已在安全点挂起，把残留 SATB
++    日志和标记栈一次性排空，杜绝「漏标 -> 活对象被当垃圾清除」。
++
++三、STW 安全点协议（无死锁）
++  * mutator 在每次操作的循环边界进入协作式安全点 safepoint()。
++  * GC 通过 epoch + Condition + acks 集合挂起全部 mutator：
++    epoch 推进并广播 -> mutator 在安全点登记 ack -> GC 收齐 ack 才开始清扫。
++  * 锁序全局唯一：stop_cond 锁 -> heap_lock，从不反向获取；
++    等待条件时不持有 heap_lock；所有等待均带超时并以 running 标志兜底，
++    因此即使线程被异常中断也不会永久挂死。
++
++四、前端（/）
++  原生 HTML + Canvas，20Hz 轮询 /state，独立 rAF 渲染循环：
++  存活对象 / 未抵达对象 / 垃圾对象 / 空槽，并发标记光标青色余晖，
++  STW 清扫红色扫描线逐行压屏，分配与回收闪光，STW 红屏与停顿计时。
++"""
++
++import argparse
++import base64
++import json
++import random
++import threading
++import time
++import webbrowser
++from collections import deque
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++from urllib.parse import urlparse
++
++
++# ----------------------------------------------------------------------------
++# 网格 / 颜色 / GC 阶段常量
++# ----------------------------------------------------------------------------
++GRID_W = 80
++GRID_H = 44
++CELLS_N = GRID_W * GRID_H
++
++# color 缓冲区取值（前端按同一约定上色）
++C_EMPTY = 0      # 空槽
++C_ALIVE = 1      # 已确认存活（已标记 / 空闲期对象）
++C_UNREACHED = 2  # 已占用但本轮标记尚未抵达
++C_GARBAGE = 3    # STW 重标记后判定为垃圾
++
++# GC 扫描光标类型
++CUR_MARK = 1     # 并发标记 / 重标记光标：青色
++CUR_SWEEP = 2    # STW 清除扫描线：红色
++
++PHASE_IDLE = "idle"
++PHASE_MARK = "concurrent_mark"
++PHASE_STW_REMARK = "stw_remark"
++PHASE_STW_SWEEP = "stw_sweep"
++PHASE_NAMES = {
++    PHASE_IDLE: "运行中（无 GC）",
++    PHASE_MARK: "并发标记",
++    PHASE_STW_REMARK: "STW 重标记",
++    PHASE_STW_SWEEP: "STW 清除",
++}
++
++ROOT_CAP = 6                 # 每个 mutator 保留的 root 上限
++GC_FILL_TRIGGER = 0.92       # 占用率超过该值时不等周期，提前触发 GC
++MAX_EDGES = 3                # 单个对象的出边上限
++TRAIL_TTL = 1.2              # 光标轨迹保留时长（秒）
++
++
++class Simulation(object):
++    """堆 + GC + mutator 的并发仿真内核。"""
++
++    def __init__(self, n_mutators=4, rate_total=500.0,
++                 gc_interval=3.5, sweep_step=2, sweep_sleep=0.012,
++                 prewarm=True):
++        self.w = GRID_W
++        self.h = GRID_H
++        self.n = CELLS_N
++
++        # 堆：cells[i] 为对象 i 的出边集合；None 表示空槽
++        self.cells = [None] * self.n
++        self.mark = bytearray(self.n)          # 标记位
++        self.color = bytearray(self.n)         # 面向前端的显示状态
++        self.pos_of = [-1] * self.n            # occupied 列表中的位置（O(1) 删除）
++        self.occupied = []                     # 已占用槽位
++        self.free = list(range(self.n))        # 空闲槽位
++        random.shuffle(self.free)
++
++        # 并发标记相关
++        self.phase = PHASE_IDLE
++        self.marking = False
++        self.mark_stack = []
++        self.satb = []                         # SATB 旧值日志
++        self.trail = deque(maxlen=512)         # GC 光标轨迹 (idx, kind, t)
++
++        # 锁
++        self.heap_lock = threading.RLock()
++        self.stop_lock = threading.Lock()
++        self.stop_cond = threading.Condition(self.stop_lock)
++        self.epoch = 0                         # STW 代际号，结束 STW 时 +1
++        self.stw_epoch = -1                    # 当前要求挂起的代际号
++        self.acks = set()
++
++        # 运行控制
++        self.running = True
++        self.paused = False
++        self.manual_gc = threading.Event()
++
++        # 参数
++        self.n_mutators = int(n_mutators)
++        self.rate_total = float(rate_total)
++        self.gc_interval = float(gc_interval)
++        self.sweep_step = int(sweep_step)
++        self.sweep_sleep = float(sweep_sleep)
++
++        # 统计
++        self.total_alloc = 0
++        self.total_freed = 0
++        self.total_cycles = 0
++        self.last_freed = 0
++        self.last_pause_ms = 0.0
++        self.last_mark_ms = 0.0
++        self.stw_count = 0
++        self.stw_timeouts = 0
++        self.gen = 1                          # 配置重置代际号（前端使用）
++        self._last_cursor = None
++        self._alloc_base = 0
++        self._freed_base = 0
++        self._stat_t = time.time()
++
++        self.mutators = [Mutator(i, self) for i in range(self.n_mutators)]
++        self.gc = GcThread(self)
++        if prewarm:
++            self.prewarm()
++
++    # ------------------------------------------------------------------
++    # 堆内部操作（调用方必须持有 heap_lock）
++    # ------------------------------------------------------------------
++    def _occupied_sample_locked(self, rng):
++        if not self.occupied:
++            return -1
++        return self.occupied[rng.randrange(len(self.occupied))]
++
++    def _alloc_locked(self, rng):
++        """从空闲链表取一个槽，初始化为新对象，返回下标；堆满返回 -1。"""
++        if not self.free:
++            return -1
++        idx = self.free.pop()
++        edges = set()
++        for _ in range(rng.randint(0, 2)):
++            target = self._occupied_sample_locked(rng)
++            if target >= 0 and target != idx and len(edges) < MAX_EDGES:
++                edges.add(target)
++        self.cells[idx] = edges
++        self.pos_of[idx] = len(self.occupied)
++        self.occupied.append(idx)
++        # 标记期间分配：作为 mutator 新 root 立即标记
++        if self.marking:
++            self._mark_push_locked(idx)
++            self.color[idx] = C_ALIVE
++        else:
++            self.color[idx] = C_ALIVE if self.phase == PHASE_IDLE else C_UNREACHED
++        self.total_alloc += 1
++        return idx
++
++    def _free_locked(self, idx):
++        self.cells[idx] = None
++        self.mark[idx] = 0
++        self.color[idx] = C_EMPTY
++        self.free.append(idx)
++        last = self.occupied.pop()
++        if last != idx:
++            pos = self.pos_of[idx]
++            self.occupied[pos] = last
++            self.pos_of[last] = pos
++        self.pos_of[idx] = -1
++        self.total_freed += 1
++
++    def _mark_push_locked(self, idx):
++        if idx < 0 or idx >= self.n or self.mark[idx]:
++            return
++        obj = self.cells[idx]
++        if obj is None:
++            return
++        self.mark[idx] = 1
++        self.mark_stack.append(idx)
++        if self.phase == PHASE_STW_REMARK:
++            self.color[idx] = C_ALIVE
++
++    def _cursor_locked(self, idx, kind):
++        now = time.time()
++        key = (idx, kind)
++        if self._last_cursor == key:
++            return
++        self._last_cursor = key
++        self.trail.append((idx, kind, now))
++
++    def _root_push(self, mutator, idx):
++        """给某 mutator 挂 root，超出上限时丢弃最旧 root（走 SATB 屏障）。"""
++        roots = mutator.roots
++        roots.append(idx)
++        if len(roots) > ROOT_CAP:
++            old = roots.pop(0)
++            if self.marking:
++                self.satb.append(old)
++
++
++# === CONT ===
+*** End Patch

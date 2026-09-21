@@ -1,0 +1,133 @@
+*** Begin Patch
+*** Update File: gc_stw_sim.py
+@@
+-// __JS_UI__
++function drawSpark() {
++  var W = sparkC.width = sparkC.clientWidth * (window.devicePixelRatio || 1);
++  var H = sparkC.height = 56 * (window.devicePixelRatio || 1);
++  sx.clearRect(0, 0, W, H);
++  if (rateHist.length < 2) return;
++  var maxV = 60;
++  for (var i = 0; i < rateHist.length; i++) {
++    if (rateHist[i].v > maxV) maxV = rateHist[i].v;
++  }
++  var n = rateHist.length;
++  // STW 区间红底
++  sx.fillStyle = "rgba(239,68,68,0.16)";
++  var segStart = -1;
++  for (i = 0; i <= n; i++) {
++    var isStw = i < n && rateHist[i].stw;
++    if (isStw && segStart < 0) segStart = i;
++    if (!isStw && segStart >= 0) {
++      sx.fillRect(segStart / n * W, 0, (i - segStart) / n * W, H);
++      segStart = -1;
++    }
++  }
++  sx.strokeStyle = "#34d399";
++  sx.lineWidth = 1.5 * (window.devicePixelRatio || 1);
++  sx.beginPath();
++  for (i = 0; i < n; i++) {
++    var px = i / (n - 1) * W;
++    var py = H - (rateHist[i].v / maxV) * (H - 6) - 3;
++    if (i === 0) sx.moveTo(px, py); else sx.lineTo(px, py);
++  }
++  sx.stroke();
++}
++
++var el = function (id) { return document.getElementById(id); };
++
++function updateHud(nowSec) {
++  if (!state) return;
++  var s = state;
++  el("phase-name").textContent = s.phase_name +
++    (s.paused ? "（已手动暂停）" : "");
++  var dot = el("phase-dot");
++  if (s.stw) { dot.style.background = "#ef4444"; dot.style.boxShadow = "0 0 10px #ef4444"; }
++  else if (s.phase === "concurrent_mark") {
++    dot.style.background = "#22d3ee"; dot.style.boxShadow = "0 0 10px #22d3ee";
++  } else { dot.style.background = "#34d399"; dot.style.boxShadow = "0 0 8px #34d399"; }
++
++  el("m-fill").textContent = s.occupied + " / " + s.free +
++    "  (" + (s.fill * 100).toFixed(1) + "%)";
++  el("m-alive").textContent = s.alive;
++  el("m-garbage").textContent = s.garbage;
++  el("m-alloc").textContent = s.alloc_rate.toFixed(0) + " obj/s";
++  el("m-freed").textContent = s.last_freed +
++    "（累计 " + s.total_freed + "）";
++  el("m-cycles").textContent = s.cycles + " / " + s.timeouts;
++  el("last-pause").textContent = s.last_pause_ms.toFixed(0) + " ms";
++
++  var timer = el("stw-timer");
++  if (s.stw) {
++    var ms = Math.max(0, (nowSec - (s.stw_begin || nowSec)) * 1000);
++    timer.textContent = ms.toFixed(0) + " ms";
++  } else {
++    timer.textContent = "0 ms";
++  }
++  el("stw-banner").style.opacity = s.stw ? "1" : "0";
++  el("stw-badge").textContent = s.phase === "stw_sweep"
++    ? "STW · SWEEPING（分配完全静止）"
++    : "STW · REMARK（所有应用线程已挂起）";
++
++  var html = "";
++  for (var i = 0; i < s.threads.length; i++) {
++    var t = s.threads[i];
++    html += "<div class='thr" + (t.parked ? " parked" : "") + "'>" +
++      "<span class='tdot'></span><span>" + t.name + "</span>" +
++      "<span style='color:#5a6b82'>" + (t.parked ? "parked @ safepoint" : "running") +
++      "</span><span class='ops'>" + t.ops + " ops</span></div>";
++  }
++  el("threads").innerHTML = html;
++}
++
++function frame() {
++  var nowSec = (typeof performance !== "undefined" ? performance.now() : Date.now()) / 1000;
++  // 前端时钟与后端时戳对齐（秒级同一时基即可）
++  var renderSec = state ? (state.t + (nowSec - frame._lastLocal || 0)) : nowSec;
++  if (state) {
++    frame._lastLocal = nowSec;
++    frame._lastState = state.t;
++  }
++  var t = state ? state.t + (nowSec - (frame._clientAt || nowSec)) : nowSec;
++  drawGrid(t);
++  updateHud(t);
++  drawSpark();
++  requestAnimationFrame(frame);
++}
++
++el("btn-pause").addEventListener("click", function () {
++  paused = !paused;
++  el("btn-pause").textContent = paused ? "恢复应用" : "暂停应用";
++  postAction({action: "pause", value: paused});
++});
++el("btn-gc").addEventListener("click", function () {
++  postAction({action: "gc"});
++});
++
++function bindSlider(id, vid, suffix) {
++  var input = el(id), label = el(vid);
++  input.addEventListener("input", function () {
++    label.textContent = input.value + (suffix || "");
++  });
++}
++bindSlider("s-threads", "v-threads");
++bindSlider("s-rate", "v-rate");
++bindSlider("s-gc", "v-gc");
++bindSlider("s-sweep", "v-sweep");
++
++el("btn-reset").addEventListener("click", function () {
++  var gcSec = parseFloat(el("s-gc").value);
++  postAction({
++    action: "reset",
++    n_mutators: parseInt(el("s-threads").value, 10),
++    rate_total: parseFloat(el("s-rate").value),
++    gc_interval: gcSec,
++    sweep_step: parseInt(el("s-sweep").value, 10),
++    // 扫描行数越快（步长大），行间 sleep 越短；统一换算给后端
++    sweep_sleep: +(0.014 - (parseInt(el("s-sweep").value, 10) - 1) * 0.002).toFixed(3)
++  });
++});
++
++poll();
++requestAnimationFrame(frame);
+*** End Patch

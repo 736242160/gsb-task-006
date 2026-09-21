@@ -1,0 +1,155 @@
+*** Begin Patch
+*** Update File: gc_stw_sim.py
+@@
+-# === CONT4 ===
++class SimServer(object):
++    """内置 HTTP 服务：/ 返回原生页面，/state 返回快照，/control 接收控制。"""
++
++    def __init__(self, host, port, params, open_browser=True):
++        self.host = host
++        self.port = port
++        self.params = dict(params)
++        self.open_browser = open_browser
++        self.swap_lock = threading.Lock()
++        self.sim = Simulation(**self.params)
++        self.sim.start_threads()
++
++        handler = self._make_handler()
++        self.httpd = ThreadingHTTPServer((host, port), handler)
++        self.port = self.httpd.server_address[1]
++        self.httpd.daemon_threads = True
++        self.thread = threading.Thread(target=self.httpd.serve_forever,
++                                       name="http", daemon=True)
++
++    def _make_handler(self):
++        outer = self
++
++        class Handler(BaseHTTPRequestHandler):
++            def log_message(self, *args):
++                pass
++
++            def _send(self, code, body, ctype="application/json; charset=utf-8"):
++                data = body if isinstance(body, bytes) else body.encode("utf-8")
++                self.send_response(code)
++                self.send_header("Content-Type", ctype)
++                self.send_header("Content-Length", str(len(data)))
++                self.send_header("Cache-Control", "no-store")
++                self.end_headers()
++                self.wfile.write(data)
++
++            def do_GET(self):
++                path = urlparse(self.path).path
++                if path in ("/", "/index.html"):
++                    self._send(200, HTML_PAGE, "text/html; charset=utf-8")
++                elif path == "/state":
++                    with outer.swap_lock:
++                        sim = outer.sim
++                    try:
++                        payload = sim.snapshot()
++                    except Exception as exc:  # 快照绝不能打挂服务
++                        payload = {"error": str(exc)}
++                    self._send(200, json.dumps(payload, ensure_ascii=False))
++                elif path == "/favicon.ico":
++                    self._send(204, b"")
++                else:
++                    self._send(404, json.dumps({"error": "not found"}))
++
++            def do_POST(self):
++                path = urlparse(self.path).path
++                if path != "/control":
++                    self._send(404, json.dumps({"error": "not found"}))
++                    return
++                length = int(self.headers.get("Content-Length") or 0)
++                raw = self.rfile.read(length) if length else b"{}"
++                try:
++                    data = json.loads(raw.decode("utf-8") or "{}")
++                except Exception:
++                    data = {}
++                action = str(data.get("action", ""))
++                with outer.swap_lock:
++                    sim = outer.sim
++                    if action == "pause":
++                        sim.paused = bool(data.get("value", True))
++                        with sim.stop_cond:
++                            sim.stop_cond.notify_all()
++                    elif action == "gc":
++                        sim.manual_gc.set()
++                    elif action == "reset":
++                        params = dict(outer.params)
++                        for key in ("n_mutators", "rate_total",
++                                    "gc_interval", "sweep_step", "sweep_sleep"):
++                            if key in data:
++                                params[key] = data[key]
++                        params["n_mutators"] = int(params["n_mutators"])
++                        params["rate_total"] = float(params["rate_total"])
++                        params["gc_interval"] = float(params["gc_interval"])
++                        params["sweep_step"] = int(params["sweep_step"])
++                        params["sweep_sleep"] = float(params["sweep_sleep"])
++                        outer.params = params
++                        old = outer.sim
++                        new_sim = Simulation(**params)
++                        outer.sim = new_sim
++                        new_sim.start_threads()
++                        old.shutdown()
++                    result = {"ok": True}
++                self._send(200, json.dumps(result, ensure_ascii=False))
++
++        return Handler
++
++    def serve(self):
++        url = "http://%s:%d/" % ("127.0.0.1" if self.host in ("0.0.0.0", "")
++                                 else self.host, self.port)
++        print("=" * 64)
++        print(" GC STW simulation kernel is running")
++        print(" open: %s" % url)
++        print(" press Ctrl+C to stop")
++        print("=" * 64)
++        self.thread.start()
++        if self.open_browser:
++            threading.Timer(0.8, lambda: webbrowser.open(url)).start()
++        try:
++            while True:
++                time.sleep(0.5)
++        except KeyboardInterrupt:
++            print("\nshutting down ...")
++        finally:
++            with self.swap_lock:
++                self.sim.shutdown()
++            self.httpd.shutdown()
++
++
++def main():
++    parser = argparse.ArgumentParser(
++        description="GC Stop-The-World concurrent mark-sweep simulation "
++                    "(stdlib only).")
++    parser.add_argument("--host", default="127.0.0.1")
++    parser.add_argument("--port", type=int, default=8000)
++    parser.add_argument("--threads", type=int, default=4,
++                        help="number of mutator threads")
++    parser.add_argument("--rate", type=float, default=500.0,
++                        help="total mutator operations per second")
++    parser.add_argument("--gc-interval", type=float, default=3.5,
++                        help="GC cycle interval in seconds")
++    parser.add_argument("--sweep-step", type=int, default=2,
++                        help="grid rows swept per STW batch")
++    parser.add_argument("--sweep-sleep", type=float, default=0.012,
++                        help="sleep seconds between STW sweep batches")
++    parser.add_argument("--no-browser", action="store_true",
++                        help="do not open the browser automatically")
++    args = parser.parse_args()
++
++    params = {
++        "n_mutators": args.threads,
++        "rate_total": args.rate,
++        "gc_interval": args.gc_interval,
++        "sweep_step": args.sweep_step,
++        "sweep_sleep": args.sweep_sleep,
++    }
++    server = SimServer(args.host, args.port, params,
++                       open_browser=not args.no_browser)
++    server.serve()
++
++
++if __name__ == "__main__":
++    main()
+*** End Patch

@@ -1,0 +1,177 @@
+*** Begin Patch
+*** Update File: gc_stw_sim.py
+@@
+-# === CONT2 ===
++class GcThread(threading.Thread):
++    """GC 线程：定期触发标记-清除周期。"""
++
++    def __init__(self, sim):
++        super(GcThread, self).__init__(name="gc", daemon=True)
++        self.sim = sim
++        self.rng = random.Random()
++
++    def run(self):
++        sim = self.sim
++        while sim.running:
++            # 等待「周期到 / 堆满 / 手动触发」三者最早发生
++            wait_end = time.time() + sim.gc_interval
++            while sim.running:
++                if sim.manual_gc.is_set():
++                    sim.manual_gc.clear()
++                    break
++                with sim.heap_lock:
++                    fill = len(sim.occupied) / float(sim.n)
++                if fill >= GC_FILL_TRIGGER:
++                    break
++                left = wait_end - time.time()
++                if left <= 0:
++                    break
++                if sim.manual_gc.wait(timeout=min(0.1, max(0.0, left))):
++                    sim.manual_gc.clear()
++                    break
++            if not sim.running:
++                break
++            with sim.heap_lock:
++                if not sim.occupied:
++                    continue
++            self._cycle()
++
++    # ------------------------------------------------------------------
++    # 阶段 1：并发标记（mutator 照常运行，写屏障保证不漏标）
++    # ------------------------------------------------------------------
++    def _concurrent_mark(self):
++        sim = self.sim
++        t0 = time.time()
++        with sim.heap_lock:
++            sim.phase = PHASE_MARK
++            sim.marking = True
++            sim.mark_stack = []
++            sim.satb = []
++            sim.mark = bytearray(sim.n)
++            # 标记开始瞬间，所有已占用对象先渲染为「未抵达」，
++            # 随着光标的游走逐个翻成存活，形成波纹感
++            for idx in sim.occupied:
++                sim.color[idx] = C_UNREACHED
++            # 初始 root 集合打标（所有 mutator 的 root）
++            for m in sim.mutators:
++                for r in m.roots:
++                    sim._mark_push_locked(r)
++
++        while sim.running:
++            with sim.heap_lock:
++                budget = 96
++                while budget > 0 and sim.mark_stack:
++                    idx = sim.mark_stack.pop()
++                    obj = sim.cells[idx]
++                    if obj is None or not sim.mark[idx]:
++                        continue
++                    sim.color[idx] = C_ALIVE
++                    sim._cursor_locked(idx, CUR_MARK)
++                    for ref in list(obj):
++                        sim._mark_push_locked(ref)
++                    budget -= 1
++                # 并发期间积压的 SATB 旧值同样入栈
++                while sim.satb:
++                    sim._mark_push_locked(sim.satb.pop())
++                drained = not sim.mark_stack and not sim.satb
++            if drained:
++                # 释放 heap_lock 后再观察一次日志：
++                # 若恰好在退出瞬间有 mutator 追加旧值，下一轮再排空
++                with sim.heap_lock:
++                    if not sim.satb and not sim.mark_stack:
++                        break
++            time.sleep(0.005)
++        sim.last_mark_ms = (time.time() - t0) * 1000.0
++
++    # ------------------------------------------------------------------
++    # 阶段 2 + 3：STW 重标记（收敛）与 STW 清除（逐行扫描线）
++    # ------------------------------------------------------------------
++    def _stw_remark_and_sweep(self):
++        sim = self.sim
++        t0 = time.time()
++        ok = sim.begin_stw(PHASE_STW_REMARK)
++        if not ok:
++            # 关停中：复位标记状态，直接返回（end_stw 不调用，
++            # 因为 begin_stw 失败时尚未生效）
++            with sim.heap_lock:
++                sim.marking = False
++                sim.phase = PHASE_IDLE
++            return
++        try:
++            # --- 重标记：mutator 全部挂起，图不再变化，一次排空 ---
++            with sim.heap_lock:
++                while sim.satb:
++                    sim._mark_push_locked(sim.satb.pop())
++                while sim.mark_stack:
++                    idx = sim.mark_stack.pop()
++                    obj = sim.cells[idx]
++                    if obj is None or not sim.mark[idx]:
++                        continue
++                    sim.color[idx] = C_ALIVE
++                    sim._cursor_locked(idx, CUR_MARK)
++                    for ref in list(obj):
++                        sim._mark_push_locked(ref)
++                # 未标记的占用对象即垃圾：翻成琥珀红，给肉眼一个停顿
++                for idx in sim.occupied:
++                    if not sim.mark[idx]:
++                        sim.color[idx] = C_GARBAGE
++            time.sleep(0.12)  # 展示性停顿：垃圾全部翻红、分配完全静止
++
++            # --- 清除：红色扫描线逐行压过整屏 ---
++            with sim.heap_lock:
++                sim.phase = PHASE_STW_SWEEP
++                freed = 0
++                to_free = [i for i in sim.occupied if not sim.mark[i]]
++                garbage = set(to_free)
++            row_start = 0
++            step = max(1, sim.sweep_step)
++            while row_start < sim.h and sim.running:
++                row_end = min(row_start + step, sim.h)
++                with sim.heap_lock:
++                    lo = row_start * sim.w
++                    hi = row_end * sim.w
++                    for idx in to_free:
++                        if lo <= idx < hi:
++                            sim._free_locked(idx)
++                            freed += 1
++                    sim._cursor_locked(lo, CUR_SWEEP)
++                row_start = row_end
++                time.sleep(sim.sweep_sleep)
++
++            # 清除悬空出边 / 悬空 root（对象已物理回收）
++            with sim.heap_lock:
++                for idx in sim.occupied:
++                    edges = sim.cells[idx]
++                    if edges:
++                        dead = [e for e in edges if e in garbage]
++                        for e in dead:
++                            edges.discard(e)
++                for m in sim.mutators:
++                    if m.roots:
++                        m.roots = [r for r in m.roots if r not in garbage]
++                # 存活对象恢复常亮绿色
++                for idx in sim.occupied:
++                    sim.color[idx] = C_ALIVE
++                sim.marking = False
++                sim.mark_stack = []
++                sim.satb = []
++                sim.mark = bytearray(sim.n)
++                sim.phase = PHASE_IDLE
++                sim.total_cycles += 1
++                sim.last_freed = freed
++        finally:
++            sim.end_stw()
++        sim.last_pause_ms = (time.time() - t0) * 1000.0
++
++    def _cycle(self):
++        self._concurrent_mark()
++        if not self.sim.running:
++            with self.sim.heap_lock:
++                self.sim.marking = False
++                self.sim.phase = PHASE_IDLE
++            return
++        self._stw_remark_and_sweep()
++
++
++# === CONT3 ===
+*** End Patch

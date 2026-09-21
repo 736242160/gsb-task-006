@@ -1,0 +1,11 @@
+*** Begin Patch
+*** Update File: gc_stw_sim.py
+@@
+         # 运行控制
+         self.running = True
+         self.paused = False
+         self.manual_gc = threading.Event()
++        # STW 已生效（所有 mutator 已在安全点挂起）。
++        # phase 只表示 GC 想进入的阶段；stw_armed 才是「世界已停止」。
++        self.stw_armed = threading.Event()
+*** End Patch

@@ -1,0 +1,18 @@
+*** Begin Patch
+*** Update File: gc_stw_sim.py
+@@
+     def begin_stw(self, phase):
+-        """挂起全部 mutator。成功返回 True；关停或超时返回 False。"""
+-        with self.heap_lock:
+-            self.phase = phase
+-            self.stw_begin_t = time.time()
++        """挂起全部 mutator。成功返回 True；关停或超时返回 False。
++
++        关键约束：本方法必须在未持有 heap_lock 时调用——否则所有
++        mutator 都堵在 heap_lock 上无法抵达安全点，GC 将自死锁。
++        这里只做一次极短的加锁设置阶段，随即释放。
++        """
++        with self.heap_lock:
++            self.phase = phase
++            self.stw_begin_t = time.time()
+*** End Patch

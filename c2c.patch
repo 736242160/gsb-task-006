@@ -1,0 +1,119 @@
+*** Begin Patch
+*** Update File: gc_stw_sim.py
+@@
+-# === CONT3 ===
++    # ------------------------------------------------------------------
++    # 预热：开演前构造一张引用图——约 32% 存活（root 可达链），
++    # 约 26% 无根垃圾（含环），第一次 GC 就能看到明显回收。
++    # ------------------------------------------------------------------
++    def prewarm(self):
++        rng = random.Random(20260921)
++        with self.heap_lock:
++            live_target = int(self.n * 0.32)
++            garbage_target = int(self.n * 0.26)
++            live = []
++            garbage = []
++            for _ in range(live_target):
++                idx = self._alloc_locked(rng)
++                if idx < 0:
++                    break
++                live.append(idx)
++            for _ in range(garbage_target):
++                idx = self._alloc_locked(rng)
++                if idx < 0:
++                    break
++                garbage.append(idx)
++            # 存活对象串成链并少量交织引用
++            for pos, idx in enumerate(live):
++                edges = self.cells[idx]
++                if pos + 1 < len(live):
++                    edges.add(live[pos + 1])
++                if pos + 3 < len(live) and rng.random() < 0.3:
++                    edges.add(live[pos + 3])
++            # 垃圾对象彼此引用并成环，保证「引用计数无法回收」的演示点
++            for pos, idx in enumerate(garbage):
++                edges = self.cells[idx]
++                edges.add(garbage[(pos + 1) % len(garbage)])
++                if rng.random() < 0.25 and len(garbage) > 2:
++                    edges.add(garbage[rng.randrange(len(garbage))])
++            # 存活链头挂到第一个 mutator 的 root（每 160 个挂一个）
++            if self.mutators:
++                anchor = self.mutators[0]
++                for pos in range(0, len(live), 160):
++                    anchor.roots.append(live[pos])
++
++    # ------------------------------------------------------------------
++    # 只读快照：HTTP 线程高频调用。
++    # 只做一次短时加锁的内存拷贝，绝不与后台生命周期操作交叉，
++    # 前端渲染完全基于返回的副本，后台继续高频并发不受影响。
++    # ------------------------------------------------------------------
++    def snapshot(self):
++        now = time.time()
++        with self.heap_lock:
++            occupied = len(self.occupied)
++            free_n = len(self.free)
++            marked = sum(self.mark)
++            phase = self.phase
++            marking = self.marking
++            colors = base64.b64encode(bytes(self.color)).decode("ascii")
++            cutoff = now - TRAIL_TTL
++            trail = [[idx, kind, round(ts, 3)]
++                     for idx, kind, ts in self.trail if ts >= cutoff]
++            total_alloc = self.total_alloc
++            total_freed = self.total_freed
++            last_freed = self.last_freed
++            last_pause = self.last_pause_ms
++            last_mark = self.last_mark_ms
++            cycles = self.total_cycles
++            timeouts = self.stw_timeouts
++            stw_begin = self.stw_begin_t if phase in (
++                PHASE_STW_REMARK, PHASE_STW_SWEEP) else 0.0
++            dt = max(1e-6, now - self._stat_t)
++            alloc_rate = (total_alloc - self._alloc_base) / dt
++            freed_rate = (total_freed - self._freed_base) / dt
++            self._alloc_base = total_alloc
++            self._freed_base = total_freed
++            self._stat_t = now
++            threads = [{"name": m.name, "parked": m.parked,
++                        "ops": m.ops} for m in self.mutators]
++            paused = self.paused
++            gen = self.gen
++        if phase == PHASE_IDLE:
++            alive = occupied
++            garbage_n = 0
++        else:
++            alive = marked
++            garbage_n = occupied - marked
++        return {
++            "gen": gen,
++            "t": round(now, 3),
++            "w": self.w,
++            "h": self.h,
++            "colors": colors,
++            "trail": trail,
++            "phase": phase,
++            "phase_name": PHASE_NAMES[phase],
++            "stw": phase in (PHASE_STW_REMARK, PHASE_STW_SWEEP),
++            "stw_begin": round(stw_begin, 3),
++            "marking": marking,
++            "paused": paused,
++            "occupied": occupied,
++            "free": free_n,
++            "alive": alive,
++            "garbage": garbage_n,
++            "fill": occupied / float(self.n),
++            "alloc_rate": round(alloc_rate, 1),
++            "freed_rate": round(freed_rate, 1),
++            "total_alloc": total_alloc,
++            "total_freed": total_freed,
++            "last_freed": last_freed,
++            "last_pause_ms": round(last_pause, 1),
++            "last_mark_ms": round(last_mark, 1),
++            "cycles": cycles,
++            "timeouts": timeouts,
++            "threads": threads,
++        }
++
++
++# === CONT4 ===
+*** End Patch

@@ -1,0 +1,23 @@
+*** Begin Patch
+*** Update File: gc_stw_sim.py
+@@
+         with self.heap_lock:
+             self.phase = phase
+             self.stw_begin_t = time.time()
++        self.stw_armed.clear()
+         with self.stop_cond:
+@@
+                 need = {(m.tid, epoch) for m in self.mutators
+                         if m.alive and m is not threading.current_thread()}
+                 if need <= self.acks:
+                     self.stw_count += 1
++                    self.stw_armed.set()
+                     return True
+@@
+     def end_stw(self):
++        self.stw_armed.clear()
+         with self.stop_cond:
+             self.epoch = self.stw_epoch
+             self.acks = set()
+             self.stop_cond.notify_all()
+*** End Patch

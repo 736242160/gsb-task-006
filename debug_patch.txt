@@ -1,0 +1,33 @@
+*** Begin Patch
+*** Add File: gc_stw_sim.py
++#!/usr/bin/env python3
++# -*- coding: utf-8 -*-
++"""
++gc_stw_sim.py —— 自研 VM 的 GC / Stop-The-World 并发仿真内核（单文件闭环）
++
++仅依赖 Python 标准库：
++  - threading        应用线程(mutator) / GC 线程 / 内置 HTTP 服务线程
++  - http.server      渲染原生 HTML + Canvas 页面并推送仿真快照
++  - json / base64    堆网格快照编码
++  - webbrowser       一键打开演示页面
++
++一、并发模型
++  * N 个 mutator 线程：随机分配对象、改写引用边、丢弃 root，持续制造垃圾。
++  * 1 个 GC 线程：定期执行「并发标记 -> STW 重标记 -> STW 清除」。
++  * 任意数量的 HTTP 线程：只读拷贝快照，绝不阻塞后台线程。
++
++二、并发图遍历的读写竞态处理（严格保守，保证不漏标）
++  * heap_lock 是唯一的堆锁，保护对象表/引用边/mark 位/颜色/统计量。
++  * SATB（Snapshot-At-The-Beginning）旧值写屏障：
++        改写或删除出边、从 root 集合摘除对象之前，先把旧目标记入 satb 日志。
++    于是并发标记开始那一刻「逻辑存活」的对象，即使引用随后被 mutator
++    删光，也会被日志兜住并继续扫描。
++  * 新增量屏障（incremental update）：标记期间新加入的出边，若目标未标记
++    则立即入栈——这是比 SATB 更强的一层保守保护。
++  * 标记期间新分配的对象一律立即标记（视为 mutator 的新 root）。
++  * 最终标记收敛(remark)阶段所有 mutator 已在安全点挂起，把残留 SATB
++    日志和标记栈一次性排空，杜绝「漏标 -> 活对象被当垃圾清除」。
++
++三、STW 安全点协议（无死锁）
++  * mutator 在每次操作的循环边界进入协作式安全点 safepoint()。
+*** End Patch

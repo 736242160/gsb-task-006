@@ -1,0 +1,22 @@
+*** Begin Patch
+*** Update File: gc_stw_sim.py
+@@
+ function frame() {
+-  var nowSec = (typeof performance !== "undefined" ? performance.now() : Date.now()) / 1000;
+-  // 前端时钟与后端时戳对齐（秒级同一时基即可）
+-  var renderSec = state ? (state.t + (nowSec - frame._lastLocal || 0)) : nowSec;
+-  if (state) {
+-    frame._lastLocal = nowSec;
+-    frame._lastState = state.t;
+-  }
+-  var t = state ? state.t + (nowSec - (frame._clientAt || nowSec)) : nowSec;
++  var clientNow = (typeof performance !== "undefined" ? performance.now() : Date.now()) / 1000;
++  // 后端时戳与客户端时钟存在固定偏移，这里换算成「服务器时基」，
++  // 保证轨迹衰减、闪光和 STW 计时与后端快照同一时基。
++  var t = state ? (state.t + (clientNow - frame._clientAt)) : clientNow;
+   drawGrid(t);
+   updateHud(t);
+   drawSpark();
+   requestAnimationFrame(frame);
+ }
+*** End Patch

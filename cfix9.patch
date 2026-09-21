@@ -1,0 +1,25 @@
+*** Begin Patch
+*** Update File: gc_stw_sim.py
+@@
+     # 可被 STW / 暂停立即打断的操作间隔睡眠
+     def _sleep_interruptible(self, seconds):
+         end = time.time() + seconds
+         while self.sim.running:
+             left = end - time.time()
+             if left <= 0:
+                 return
+-            with self.sim.stop_cond:
+-                if self.sim.paused or self.sim.stw_epoch > self.sim.epoch:
+-                    return
+-                self.sim.stop_cond.wait(timeout=min(0.02, left))
++            # 热路径：绝大多数时候既没暂停也没 STW，只读一次布尔/整数
++            # （CPython GIL 下原子可见）即可直接睡，避免每个操作都去
++            # 争抢 stop_cond 锁——那会让所有 mutator 与 GC 互相拖慢。
++            if not self.sim.paused and self.sim.stw_epoch <= self.sim.epoch:
++                time.sleep(min(0.02, left))
++                continue
++            with self.sim.stop_cond:
++                if self.sim.paused or self.sim.stw_epoch > self.sim.epoch:
++                    return
++                self.sim.stop_cond.wait(timeout=min(0.02, left))
+*** End Patch

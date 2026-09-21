@@ -1,0 +1,9 @@
+*** Begin Patch
+*** Update File: gc_stw_sim.py
+@@
+       prevColors = colors;
+       s._colors = colors;
+       state = s;
++      frame._clientAt = (typeof performance !== "undefined" ? performance.now() : Date.now()) / 1000;
+       if (s.stw && !stwActive) { stwActive = true; stwBegin = s.stw_begin || s.t; }
+*** End Patch

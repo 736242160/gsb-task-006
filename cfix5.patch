@@ -1,0 +1,10 @@
+*** Begin Patch
+*** Update File: gc_stw_sim.py
+@@
+-        self.epoch = 0                         # STW 代际号，结束 STW 时 +1
+-        self.stw_epoch = -1                    # 当前要求挂起的代际号
++        # STW 代际号：两者初始同为 -1，begin_stw 推进 stw_epoch，
++        # mutator 发现 stw_epoch > epoch 即挂起；end_stw 让两者追平。
++        self.epoch = -1
++        self.stw_epoch = -1
+*** End Patch
